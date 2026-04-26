@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter_map(|(name, entry)| {
             if let HeaderEntry::Tensor(_) = entry {
-                st.get_tensor(name).ok().map(|w| (name, w))
+                st.get_tensor::<f32>(name).ok().map(|w| (name, w))
             } else {
                 None
             }
