@@ -3,9 +3,73 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use half::{bf16, f16};
 use memmap2::Mmap;
 use serde::Deserialize;
 use thiserror::Error;
+
+pub trait QuantizationSource: bytemuck::Pod + Send + Sync {
+    fn to_f32(&self) -> f32;
+    fn from_f32(val: f32) -> Self;
+}
+
+impl QuantizationSource for f32 {
+    #[inline(always)]
+    fn to_f32(&self) -> f32 {
+        *self
+    }
+
+    #[inline(always)]
+    fn from_f32(val: f32) -> Self {
+        val
+    }
+}
+
+impl QuantizationSource for f16 {
+    #[inline(always)]
+    fn to_f32(&self) -> f32 {
+        self.to_f32()
+    }
+
+    #[inline(always)]
+    fn from_f32(val: f32) -> Self {
+        f16::from_f32(val)
+    }
+}
+
+impl QuantizationSource for bf16 {
+    #[inline(always)]
+    fn to_f32(&self) -> f32 {
+        self.to_f32()
+    }
+
+    #[inline(always)]
+    fn from_f32(val: f32) -> Self {
+        bf16::from_f32(val)
+    }
+}
+
+pub trait TensorType: bytemuck::Pod + QuantizationSource {
+    fn dtype() -> &'static str;
+}
+
+impl TensorType for f32 {
+    fn dtype() -> &'static str {
+        "F32"
+    }
+}
+
+impl TensorType for f16 {
+    fn dtype() -> &'static str {
+        "F16"
+    }
+}
+
+impl TensorType for bf16 {
+    fn dtype() -> &'static str {
+        "BF16"
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct TensorInfo {
@@ -22,7 +86,6 @@ pub enum HeaderEntry {
 }
 
 pub type SafetensorHeader = HashMap<String, HeaderEntry>;
-pub type Weights = [f32]; // TODO: For now we support only f32 weights
 
 #[derive(Error, Debug)]
 pub enum SafetensorError {
@@ -56,8 +119,8 @@ pub enum SafetensorError {
     #[error("Offset overflow: Header size + tensor offsets exceed memory limits")]
     OffsetOverflow,
 
-    #[error("Unsupported dtype: expected F32, found {0}")]
-    DtypeMismatch(String),
+    #[error("Unsupported dtype: expected {expected}, found {found}")]
+    DtypeMismatch { expected: String, found: String },
 }
 
 pub struct SafeTensor {
@@ -93,7 +156,7 @@ impl SafeTensor {
         &self.header
     }
 
-    pub fn get_tensor(&self, key: &str) -> Result<&Weights, SafetensorError> {
+    pub fn get_tensor<T: TensorType>(&self, key: &str) -> Result<&[T], SafetensorError> {
         let header_entry = self
             .header
             .get(key)
@@ -104,13 +167,16 @@ impl SafeTensor {
             HeaderEntry::Metadata(_) => return Err(SafetensorError::IsMetadata(key.to_string())),
         };
 
-        if tensor_header.dtype != "F32" {
-            return Err(SafetensorError::DtypeMismatch(tensor_header.dtype.clone()));
+        if tensor_header.dtype != T::dtype() {
+            return Err(SafetensorError::DtypeMismatch {
+                expected: T::dtype().to_string(),
+                found: tensor_header.dtype.clone(),
+            });
         }
 
         let data_start = self
             .header_size
-            .checked_add(8)
+            .checked_add(8) // 8 bytes for header size
             .ok_or(SafetensorError::OffsetOverflow)?;
 
         let start = data_start
@@ -126,7 +192,7 @@ impl SafeTensor {
             .get(start..end)
             .ok_or(SafetensorError::OffsetOverflow)?;
 
-        let weights: &[f32] = bytemuck::try_cast_slice(tensor_bytes)?;
+        let weights: &[T] = bytemuck::try_cast_slice(tensor_bytes)?;
 
         Ok(weights)
     }
